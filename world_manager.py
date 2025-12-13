@@ -9,6 +9,7 @@ import amulet
 from amulet.api.block import Block
 import numpy as np
 import asyncio
+import matplotlib.pyplot as plt
 
 class MinecraftWorldManager:
     def __init__(self, server_dir="minecraft_server"):
@@ -179,122 +180,107 @@ class MinecraftWorldManager:
         return await asyncio.to_thread(_blocking_search)
 
 
-    async def get_block_matrix(self, center_x, center_y, center_z, size=5, only_visible=False):
+    async def get_block_matrix(self, cx, cy, cz, size=5, only_visible=False):
         """
-        Returns a Numpy 3D Matrix of block names.
-        Optimized: Fetches data once, then performs raycasting in-memory.
+        Returns a 3D Matrix of block names.
+        Uses Ray Marching (checking points along a line) for visibility.
+        Simple, robust, and works with any namespace.
         """
-        print(f"--- Generating {size}x{size}x{size} Matrix (Numpy Optimized) ---")
+        print(f"--- Matrix Scan ({size}x{size}x{size}) with Ray Marching ---")
 
-        def _blocking_matrix():
+        def _blocking():
             try:
                 level = amulet.load_level(self.world_path)
-            except Exception as e:
-                print(f"Error: {e}")
-                return np.array([])
-
-            radius = size // 2
+            except: return np.array([])
             
-            # 1. Create empty Numpy Array (Size: N, N, N)
-            # We use 'object' type to store arbitrary length strings
-            raw_matrix = np.empty((size, size, size), dtype=object)
+            radius = size // 2
+            # 1. Fetch Data
+            raw = np.empty((size, size, size), dtype=object)
+            min_x, max_x = cx - radius, cx + radius
+            min_y, max_y = cy - radius, cy + radius
+            min_z, max_z = cz - radius, cz + radius
 
-            # Define bounds relative to the loop
-            # We map Global Coords -> Matrix Indices [0..size]
-            min_x, max_x = center_x - radius, center_x + radius
-            min_y, max_y = center_y - radius, center_y + radius
-            min_z, max_z = center_z - radius, center_z + radius
-
-            # 2. FILL MATRIX (The slow IO part)
-            # We must fetch all blocks first so the raycaster can "see" walls
-            print("Fetching blocks...")
             for gx in range(min_x, max_x + 1):
                 for gy in range(min_y, max_y + 1):
                     for gz in range(min_z, max_z + 1):
                         lx, ly, lz = gx - min_x, gy - min_y, gz - min_z
-                        try:
-                            # Map global coord to local index
-                            
-                            if 0 <= lx < size and 0 <= ly < size and 0 <= lz < size:
-                                block = level.get_block(gx, gy, gz, "minecraft:overworld")
-                                raw_matrix[lx, ly, lz] = block.namespaced_name
-                        except:
-                            raw_matrix[lx, ly, lz] = "minecraft:air"
-
+                        if 0 <= lx < size and 0 <= ly < size and 0 <= lz < size:
+                            try:
+                                b = level.get_block(gx, gy, gz, "minecraft:overworld")
+                                raw[lx, ly, lz] = b.namespaced_name
+                            except: raw[lx, ly, lz] = "minecraft:air"
             level.close()
 
-            # If we don't care about visibility, return the raw data now
-            if not only_visible:
-                return raw_matrix
+            if not only_visible: return raw
 
-            # 3. RAYCASTING (The fast Memory part)
-            print("Calculating visibility...")
+            # 2. Ray Marching (The Simple Way)
+            visible = raw.copy()
             
-            # Create a copy for the output
-            visible_matrix = raw_matrix.copy()
-            
-            # Helper: Is this block transparent?
-            # We define a set for O(1) lookups
-            transparent_blocks = {
-                "minecraft:air", "minecraft:water", "minecraft:lava", 
-                "minecraft:glass", "minecraft:grass",
-                "minecraft:torch"
+            # Keywords to check transparency
+            transparent_keywords = {
+                "air", "water", "lava", "glass", "leaves", "grass", 
+                "fern", "flower", "torch", "poppy", "dandelion", "kelp"
             }
             
-            # Local center index (e.g., 2,2,2 for a size 5 box)
-            cx, cy, cz = radius, radius, radius
+            lcx, lcy, lcz = radius, radius, radius
 
-            # Iterate every voxel in the local matrix
-            it = np.nditer(raw_matrix, flags=['multi_index', 'refs_ok'])
+            it = np.nditer(raw, flags=['multi_index', 'refs_ok'])
             for _ in it:
-                tx, ty, tz = it.multi_index # Target Local Coords
+                tx, ty, tz = it.multi_index
+                target_name = raw[tx, ty, tz]
                 
-                target_block = raw_matrix[tx, ty, tz]
-                
-                # Optimization: Air is always "visible" (don't process sky)
-                if "air" in target_block:
-                    continue
-                    
-                # Vector from Center -> Target
-                vx, vy, vz = tx - cx, ty - cy, tz - cz
+                # Optimizations
+                if "air" in target_name: continue
+                if tx == lcx and ty == lcy and tz == lcz: continue
+
+                # Vector from Center to Target
+                vx, vy, vz = tx - lcx, ty - lcy, tz - lcz
                 dist = math.sqrt(vx**2 + vy**2 + vz**2)
                 
-                if dist == 0: continue # Center is always visible
+                if dist == 0: continue
 
-                # Normalize direction
+                # Normalize Direction
                 step_x, step_y, step_z = vx/dist, vy/dist, vz/dist
                 
-                # Ray march from Center -> Target
-                # Check every 0.5 units
-                curr_d = 0.5
-                is_occluded = False
+                # Walk along the line
+                # We start at 0.6 to skip the center block itself
+                # We stop at dist - 0.5 to stop right before the target block
+                curr_d = 0.6
+                occluded = False
                 
                 while curr_d < dist - 0.5:
-                    # Current ray position (float)
-                    rx = cx + (step_x * curr_d)
-                    ry = cy + (step_y * curr_d)
-                    rz = cz + (step_z * curr_d)
+                    # Get sample position
+                    rx = lcx + (step_x * curr_d)
+                    ry = lcy + (step_y * curr_d)
+                    rz = lcz + (step_z * curr_d)
                     
-                    # Round to nearest index
+                    # Round to nearest integer index
                     ix, iy, iz = int(round(rx)), int(round(ry)), int(round(rz))
                     
-                    # Ensure we are inside the matrix bounds
+                    # Check bounds
                     if 0 <= ix < size and 0 <= iy < size and 0 <= iz < size:
-                        block_at_ray = raw_matrix[ix, iy, iz]
+                        block_hit = raw[ix, iy, iz]
                         
-                        # If we hit a SOLID block, the target is hidden
-                        if block_at_ray not in transparent_blocks:
-                            is_occluded = True
+                        # Check transparency
+                        is_transparent = False
+                        for key in transparent_keywords:
+                            if key in block_hit:
+                                is_transparent = True
+                                break
+                        
+                        if not is_transparent:
+                            occluded = True
                             break
                     
+                    # Step size: 0.5 ensures we don't skip over any 1x1 block
                     curr_d += 0.5
 
-                if is_occluded:
-                    visible_matrix[tx, ty, tz] = "undefined"
+                if occluded:
+                    visible[tx, ty, tz] = "undefined"
 
-            return visible_matrix
+            return visible
 
-        return await asyncio.to_thread(_blocking_matrix)
+        return await asyncio.to_thread(_blocking)
 
     async def break_block(self, x, y, z):
         """
@@ -412,34 +398,120 @@ class MinecraftWorldManager:
                 return (x, y, z) # Return original if error
 
         return await asyncio.to_thread(_blocking_drop)
+    def visualize_matrix(self, matrix):
+        """
+        Visualizes the 3D block matrix using Matplotlib voxels.
+        Includes a red dot marking the center scan position.
+        Must be called from the main thread (blocking).
+        """
+        print("--- Rendering 3D Visualization ---")
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("Matplotlib not installed. Skipping visualization.")
+            return
+        
+        # 1. Define Color Palette
+        colors = {
+            "minecraft:grass_block": (0.1, 0.8, 0.1, 1.0),
+            "minecraft:dirt":        (0.6, 0.4, 0.2, 1.0),
+            "minecraft:stone":       (0.5, 0.5, 0.5, 1.0),
+            "minecraft:deepslate":   (0.3, 0.3, 0.3, 1.0),
+            "minecraft:water":       (0.1, 0.1, 0.9, 0.4), # Transparent
+            "minecraft:lava":        (1.0, 0.5, 0.0, 1.0),
+            "minecraft:sand":        (0.9, 0.9, 0.6, 1.0),
+            "minecraft:gravel":      (0.6, 0.6, 0.6, 1.0),
+            # Ores highlight
+            "minecraft:diamond_ore": (0.0, 1.0, 1.0, 1.0),
+            "minecraft:gold_ore":    (1.0, 0.8, 0.0, 1.0),
+            # Special
+            "undefined":             (0.1, 0.1, 0.1, 0.1), # Faint shadow
+            "default":               (0.8, 0.0, 0.8, 1.0)  # Magenta
+        }
+
+        # 2. Prepare Voxel Data
+        size_x, size_y, size_z = matrix.shape
+        filled = np.zeros(matrix.shape, dtype=bool)
+        voxel_colors = np.zeros(matrix.shape + (4,), dtype=float)
+
+        for x in range(size_x):
+            for y in range(size_y):
+                for z in range(size_z):
+                    block_name = matrix[x, y, z]
+                    if "air" in block_name: continue
+                    
+                    # Optional: hide undefined blocks completely
+                    # if block_name == "undefined": continue
+
+                    filled[x, y, z] = True
+                    
+                    if block_name in colors:
+                        voxel_colors[x, y, z] = colors[block_name]
+                    else:
+                        # Keyword fallbacks
+                        if "log" in block_name:   voxel_colors[x, y, z] = (0.4, 0.2, 0.0, 1.0)
+                        elif "leaf" in block_name:voxel_colors[x, y, z] = (0.1, 0.6, 0.1, 0.5)
+                        elif "ore" in block_name: voxel_colors[x, y, z] = (0.8, 0.8, 0.8, 1.0)
+                        else:                     voxel_colors[x, y, z] = colors["default"]
+
+        # 3. Plotting
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Draw the blocks
+        ax.voxels(filled, facecolors=voxel_colors, edgecolors='k', linewidth=0.1, shade=True)
+        
+        # --- DRAW CENTER DOT ---
+        # Calculate center index
+        cx_idx, cy_idx, cz_idx = size_x // 2, size_y // 2, size_z // 2
+        # Add 0.5 to put the dot in the middle of the central voxel block
+        ax.scatter(cx_idx + 0.5, cy_idx + 0.5, cz_idx + 0.5,
+                   color='red', s=200, marker='o', label='Scan Center', depthshade=False)
+        ax.legend()
+        # -----------------------
+
+        # Formatting
+        ax.set_xlabel('X Axis')
+        ax.set_ylabel('Y Axis (Height)')
+        ax.set_zlabel('Z Axis')
+        ax.set_title(f'Sigma Vision: {size_x}x{size_y}x{size_z} Scan')
+        # Invert Z axis to match Minecraft's "North is negative Z" feel visually
+        ax.invert_zaxis() 
+        
+        plt.show()
 # --- EXECUTION ---
 if __name__ == "__main__":
     manager = MinecraftWorldManager()
     
     # 1. Synchronous Setup (Server generation is still blocking/sync)
     # We generally don't make the server generation async because the OS process blocks anyway
-    manager.reset_world()
-    manager.setup_server(seed="12345")
-    manager.generate_world(radius_in_blocks=80)
+    seed = "12345"
+    # if seed
+    #     manager.reset_world()
+    #     manager.setup_server(seed="12345")
+    #     manager.generate_world(radius_in_blocks=80)
     
     # 2. Asynchronous Querying
     async def main():
-        print("\n--- Starting Async Operations ---")
+        # 1. Define Scan Parameters
+        # A size of 7-9 is best for visualization. Too large gets laggy.
+        size = 10
+        center_x, center_y, center_z = 86, 91, -106
         
-        # Example: Run a query and a search at the same time?
-        # Or just await them one by one:
+        # 2. Get the Matrix (Async)
+        print("Scanning terrain...")
+        await manager.break_block(87, 93, -109)
+        await manager.break_block(87, 92, -109)
+        await manager.break_block(87, 93, -110)
+        matrix = await manager.get_block_matrix(
+            center_x, center_y, center_z, 
+            size=size, 
+            only_visible=True # Set True to see the "Fog of War" (undefined blocks)
+        )
         
-        # Query single block
-        block_name = await manager.query_block(0, 70, 0)
-        print(f"Block at 0,70,0: {block_name}")
-        
-        # Search for ores
-        print("Starting ore search...")
-        diamonds = await manager.find_blocks("diamond_ore", search_radius_chunks=5)
-        
-        print(f"Found {len(diamonds)} diamond ore blocks.")
-        if diamonds:
-            print(f"First location: {diamonds[0]}")
+        return matrix, (center_x, center_y, center_z)
 
     # Run the async loop
-    asyncio.run(main())
+    matrix_data, center = asyncio.run(main())
+    print(matrix_data)
+    manager.visualize_matrix(matrix_data)
