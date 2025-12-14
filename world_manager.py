@@ -9,6 +9,7 @@ import amulet
 from amulet.api.block import Block
 import numpy as np
 import matplotlib.pyplot as plt
+import heapq
 
 # No asyncio needed anymore
 # import asyncio 
@@ -343,6 +344,285 @@ class MinecraftWorldManager:
         ax.set_title(f'Sigma Vision: {size_x}x{size_y}x{size_z} Scan')
         ax.invert_zaxis() 
         plt.show()
+    
+    def is_transparent(self, block_name):
+        """
+        Determines if a block is transparent (allows light/vision through).
+        Args:
+            block_name (str): The namespaced name (e.g., 'minecraft:glass')
+        Returns:
+            bool: True if transparent, False if solid/opaque.
+        """
+        # 1. Normalized check (ignore namespace prefix)
+        # We split by ':' and take the last part to get just 'glass' or 'air'
+        if ":" in block_name:
+            name = block_name.split(":")[-1].lower()
+        else:
+            name = block_name.lower()
+
+        # 2. Complete List of Transparent Keywords
+        # If the block name contains ANY of these, it is transparent.
+        transparent_keywords = {
+            "air", "void", "cave_air",
+            "water", "lava",
+            "glass", "stained_glass", "pane",
+            "leaves", "leaf",
+            "grass", "fern", "bush", "shrub", "flower", "poppy", "dandelion", "rose", "tulip", "orchid", "allium", "bluet", "daisy", "lilac", "peony",
+            "torch", "lantern", "lamp",
+            "fence", "gate", "bars",
+            "door", "trapdoor",
+            "ladder", "vine", "scaffolding",
+            "rail",
+            "carpet",
+            "snow", # snow layers
+            "mushroom", "fungus",
+            "sapling",
+            "kelp", "seagrass", "lily_pad",
+            "cobweb",
+            "slime", "honey",
+            "bamboo", "sugar_cane",
+            "chain",
+            "bed", # partial transparency
+            "banner", "sign"
+        }
+
+        # 3. Check exact matches or partial matches
+        # We check if any keyword is a substring of the block name
+        for keyword in transparent_keywords:
+            if keyword in name:
+                return True
+                
+        return False
+    
+    def is_passable(self, block_name):
+        """
+        Determines if a player can physically walk through a block.
+        UNLIKE transparency, Glass and Fences are NOT passable.
+        """
+        # Normalize name
+        if ":" in block_name:
+            name = block_name.split(":")[-1].lower()
+        else:
+            name = block_name.lower()
+
+        # 1. The "Walk-Through" List
+        # These are blocks that do not have collision boxes
+        passable_keywords = {
+            "air", "void", "cave_air",
+            "water", "lava", # Technically fluid, but you can move through them
+            "grass", "fern", "flower", "poppy", "dandelion", "rose", "tulip", "orchid",
+            "torch", "redstone_torch", "soul_torch",
+            "rail", "carpet", "snow", # Snow layers are passable usually
+            "button", "lever", "tripwire", "string",
+            "sapling", "kelp", "seagrass",
+            "cobweb", # Slows you down, but passable
+            "sign", "banner",
+            "pressure_plate"
+        }
+
+        # 2. Check keywords
+        for keyword in passable_keywords:
+            if keyword in name:
+                return True
+        
+        # 3. Special Case: Open Doors/Gates? 
+        # (Too complex for simple string matching, assuming closed/solid for now)
+        
+        return False
+
+    def check_path_clear(self, start_x, start_y, start_z, target_x, target_y, target_z):
+        """
+        Raytraces a straight line from Start to Target.
+        Returns True if the path is clear of solid obstacles.
+        """
+        print(f"--- Checking Path: {start_x},{start_y},{start_z} -> {target_x},{target_y},{target_z} ---")
+        
+        try:
+            level = amulet.load_level(self.world_path)
+        except: return False
+
+        # Vector Math
+        dx = target_x - start_x
+        dy = target_y - start_y
+        dz = target_z - start_z
+        
+        distance = math.sqrt(dx**2 + dy**2 + dz**2)
+        if distance == 0: 
+            level.close()
+            return True
+
+        # Normalize direction
+        step_x = dx / distance
+        step_y = dy / distance
+        step_z = dz / distance
+
+        # Ray Marching Setup
+        current_dist = 0.5 # Start slightly away from origin center
+        
+        is_clear = True
+        
+        while current_dist < distance:
+            # Calculate sample point
+            rx = start_x + (step_x * current_dist)
+            ry = start_y + (step_y * current_dist)
+            rz = start_z + (step_z * current_dist)
+            
+            # Get Block at this point
+            ix, iy, iz = int(round(rx)), int(round(ry)), int(round(rz))
+            
+            try:
+                # Optimized: Don't check if it's the start or target block exactly 
+                # (We assume start is safe, and target is destination)
+                if (ix == int(start_x) and iy == int(start_y) and iz == int(start_z)):
+                    pass # Inside start block
+                elif (ix == int(target_x) and iy == int(target_y) and iz == int(target_z)):
+                    pass # Hit target block
+                else:
+                    block = level.get_block(ix, iy, iz, "minecraft:overworld")
+                    name = block.namespaced_name
+                    
+                    if not self.is_passable(name):
+                        print(f"Blocked by: {name} at {ix}, {iy}, {iz}")
+                        is_clear = False
+                        break
+            except:
+                pass # Void/Error assumed safe or ignore
+            
+            current_dist += 0.5 # Check every half block
+
+        level.close()
+        return is_clear
+    
+    def is_reachable_astar(self, start, target, max_nodes=2000):
+        """
+        Uses A* Pathfinding to check if a player can WALK to the target.
+        Simulates gravity, jumping (1 block), and headroom (2 blocks).
+        
+        Args:
+            start: tuple (x, y, z)
+            target: tuple (x, y, z)
+            max_nodes: Safety limit to prevent freezing on impossible paths.
+        """
+        print(f"--- A* Pathfinding: {start} -> {target} ---")
+        
+        # 1. Open Level ONCE (Optimization)
+        try:
+            level = amulet.load_level(self.world_path)
+        except Exception as e:
+            print(f"World Load Error: {e}")
+            return False
+
+        # Helper to read blocks quickly without reopening level
+        def get_block_type(cx, cy, cz):
+            try:
+                b = level.get_block(cx, cy, cz, "minecraft:overworld")
+                return b.namespaced_name
+            except: return "minecraft:bedrock" # Treat error as solid wall
+
+        # 2. Setup A* Structures
+        # Priority Queue: (f_score, (x, y, z))
+        open_set = []
+        heapq.heappush(open_set, (0, start))
+        
+        # Tracks where we came from (for path reconstruction if needed)
+        came_from = {}
+        
+        # Cost from start to current node
+        g_score = {start: 0}
+        
+        # Heuristic (Manhattan distance is fast for grid grids)
+        def heuristic(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2])
+
+        nodes_checked = 0
+
+        # 3. The Search Loop
+        while open_set:
+            if nodes_checked > max_nodes:
+                print("A* Limit Reached (Path too complex or impossible)")
+                level.close()
+                return False
+
+            # Pop node with lowest F score
+            current_f, current = heapq.heappop(open_set)
+            nodes_checked += 1
+
+            if current == target:
+                print(f"Path Found! Checked {nodes_checked} nodes.")
+                level.close()
+                return True
+
+            cx, cy, cz = current
+            
+            # GENERATE MOVES: North, South, East, West
+            neighbors = [
+                (cx+1, cz), (cx-1, cz), (cx, cz+1), (cx, cz-1)
+            ]
+
+            for nx, nz in neighbors:
+                # We check 3 possible vertical positions for every horizontal step:
+                # 1. Flat (Walking same level)
+                # 2. Jump (Stepping up 1 block)
+                # 3. Drop (Stepping down 1 block)
+                
+                # We need to find which Y is valid
+                target_y = None
+                
+                # Query relevant blocks column at neighbor
+                # We need to know: Is head clear? Is feet clear? Is floor solid?
+                
+                # Check Flat Move (y)
+                # Needs: Air at y, Air at y+1, Solid at y-1
+                n_feet = get_block_type(nx, cy, nz)
+                n_head = get_block_type(nx, cy+1, nz)
+                n_floor = get_block_type(nx, cy-1, nz)
+                
+                if self.is_passable(n_feet) and self.is_passable(n_head) and not self.is_passable(n_floor):
+                    target_y = cy
+                
+                # Check Jump Move (y+1)
+                # Needs: Air at y+1, Air at y+2, Solid at y (The block we jump onto)
+                # AND: We need headroom at current position to jump (cx, cy+2, cz)
+                elif target_y is None: # Only check if flat failed
+                    n_jump_feet = n_head # y+1
+                    n_jump_head = get_block_type(nx, cy+2, nz) # y+2
+                    # n_feet (y) is the block we are stepping onto, so it must be solid
+                    
+                    curr_headroom = get_block_type(cx, cy+2, cz)
+                    
+                    if (self.is_passable(n_jump_feet) and 
+                        self.is_passable(n_jump_head) and 
+                        not self.is_passable(n_feet) and 
+                        self.is_passable(curr_headroom)):
+                        target_y = cy + 1
+
+                # Check Drop Move (y-1)
+                # Needs: Air at y-1, Air at y, Solid at y-2
+                elif target_y is None:
+                    n_drop_feet = n_floor # y-1
+                    n_drop_head = n_feet  # y
+                    n_drop_floor = get_block_type(nx, cy-2, nz)
+                    
+                    if (self.is_passable(n_drop_feet) and 
+                        self.is_passable(n_drop_head) and 
+                        not self.is_passable(n_drop_floor)):
+                        target_y = cy - 1
+
+                # If we found a valid move
+                if target_y is not None:
+                    neighbor = (nx, target_y, nz)
+                    
+                    # Standard cost is 1 (walking)
+                    new_g = g_score[current] + 1
+                    
+                    if neighbor not in g_score or new_g < g_score[neighbor]:
+                        g_score[neighbor] = new_g
+                        f = new_g + heuristic(neighbor, target)
+                        heapq.heappush(open_set, (f, neighbor))
+                        came_from[neighbor] = current
+
+        level.close()
+        return False
 
 # --- EXECUTION ---
 if __name__ == "__main__":
